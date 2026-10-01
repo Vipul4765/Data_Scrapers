@@ -1,0 +1,18 @@
+[Unit]
+Description=Stake Crash official round-history sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/stake-crash
+EnvironmentFile=-/opt/stake-crash/.env
+ExecStart=/opt/stake-crash/.venv/bin/stake-crash-history-sync --output-dir /var/lib/stake-crash/data --runtime-dir /var/lib/stake-crash/runtime/history
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=20
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
