@@ -119,6 +119,33 @@ This prints only JSON keys and value types, never raw payload values or credenti
 - bounded WebSocket queue;
 - graceful shutdown with flushed CSV/JSONL files.
 
+## Ubuntu server / overnight operation
+
+Production-style deployment files are under:
+
+```text
+deploy/
+├── README.md
+└── systemd/
+    ├── stake-crash.service
+    ├── stake-crash-xvfb.service
+    └── stake-crash-vnc.service
+```
+
+The server setup adds:
+
+- systemd restart on genuine process/browser failure;
+- no restart loop after HTTP 429 or repeated HTTP 403;
+- persistent data and browser-profile directories;
+- atomic `runtime/status.json` heartbeat/status;
+- optional operational webhook alerts;
+- Xvfb virtual display;
+- localhost-only VNC access through an SSH tunnel for manual security challenges.
+
+A challenge can leave the collector safely paused overnight. It does not lose or corrupt already-flushed rows, and it resumes automatically after the challenge is manually cleared.
+
+See `deploy/README.md` for installation and remote-access commands.
+
 ## Test
 
 ```powershell
