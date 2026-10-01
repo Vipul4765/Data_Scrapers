@@ -1,0 +1,14 @@
+[Unit]
+Description=Local-only VNC access for manual browser challenges
+After=stake-crash-xvfb.service
+Requires=stake-crash-xvfb.service
+
+[Service]
+Type=simple
+Environment=DISPLAY=:99
+ExecStart=/usr/bin/x11vnc -display :99 -localhost -forever -shared -nopw
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
