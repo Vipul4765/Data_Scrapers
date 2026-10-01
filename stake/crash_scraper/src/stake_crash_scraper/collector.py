@@ -11,6 +11,7 @@ from playwright.async_api import BrowserContext, Page, async_playwright
 
 from .challenge import challenge_visible
 from .config import CollectorSettings
+from .monitoring import RuntimeMonitor, WebhookNotifier
 from .parser import normalize_payload, parse_json_frame, safe_shape
 from .round_state import RoundState
 from .storage import DatasetWriter, load_or_create_player_salt
@@ -44,6 +45,7 @@ async def _probe_online_count(page: Page) -> int | None:
 async def collect(settings: CollectorSettings) -> None:
     settings.output_dir.mkdir(parents=True, exist_ok=True)
     settings.profile_dir.mkdir(parents=True, exist_ok=True)
+    settings.runtime_dir.mkdir(parents=True, exist_ok=True)
 
     player_salt = load_or_create_player_salt(settings.output_dir)
     writer = DatasetWriter(settings.output_dir)
@@ -55,7 +57,18 @@ async def collect(settings: CollectorSettings) -> None:
     collection_enabled.set()
 
     round_state = RoundState()
+    monitor = RuntimeMonitor(settings.runtime_dir)
+    notifier = WebhookNotifier(settings.alert_webhook_url)
+    monitor.set_state("STARTING")
+
     consecutive_403 = 0
+    stop_reason = "collector stopped"
+
+    async def safe_notify(event: str, message: str) -> None:
+        try:
+            await notifier.send(event, message)
+        except Exception as exc:
+            log.warning("Alert webhook failed: %s", exc)
 
     async def worker() -> None:
         while not stop.is_set() or not queue.empty():
@@ -84,6 +97,11 @@ async def collect(settings: CollectorSettings) -> None:
                     writer.write_bet(bet_row)
                 if round_row:
                     writer.write_round(round_row)
+                    monitor.update(
+                        last_round_at_utc=round_row.get("ended_at_utc"),
+                        last_round_id=round_row.get("round_id"),
+                        last_crashpoint=round_row.get("crashpoint"),
+                    )
                     log.info(
                         "round=%s crash=%.4fx players=%s bets=%s online=%s",
                         round_row.get("round_id") or round_row["local_round_uid"][:10],
@@ -99,7 +117,13 @@ async def collect(settings: CollectorSettings) -> None:
                 count = await _probe_online_count(page)
                 if count is not None:
                     round_state.update_online_count(count)
+                    monitor.update(online_count=count)
             await asyncio.sleep(settings.online_count_interval_seconds)
+
+    async def heartbeat() -> None:
+        while not stop.is_set():
+            monitor.write()
+            await asyncio.sleep(settings.heartbeat_interval_seconds)
 
     async def challenge_watcher(page: Page) -> None:
         challenge_active = False
@@ -111,19 +135,29 @@ async def collect(settings: CollectorSettings) -> None:
                 collection_enabled.clear()
                 if not challenge_active:
                     challenge_active = True
+                    monitor.set_state("CHALLENGE", "manual CAPTCHA/security verification required")
                     log.warning("Browser security/CAPTCHA challenge detected; pausing collection")
                     print(
                         "\nSecurity/CAPTCHA challenge detected. "
                         "Please solve it manually in the browser. "
                         "The collector will resume automatically afterward.\n"
                     )
+                    await safe_notify(
+                        "challenge_detected",
+                        "Stake Crash collector paused: manual CAPTCHA/security verification is required.",
+                    )
                     with suppress(Exception):
                         await page.bring_to_front()
             else:
                 if challenge_active:
                     challenge_active = False
+                    monitor.set_state("RUNNING", "challenge cleared")
                     log.info("Challenge cleared; resuming collection")
                     print("\nChallenge cleared. Collection resumed.\n")
+                    await safe_notify(
+                        "challenge_cleared",
+                        "Stake Crash collector resumed after the manual challenge was cleared.",
+                    )
                 collection_enabled.set()
 
             await asyncio.sleep(settings.challenge_check_interval_seconds)
@@ -147,14 +181,22 @@ async def collect(settings: CollectorSettings) -> None:
             ws.on("framereceived", on_frame)
 
         def on_response(response: Any) -> None:
-            nonlocal consecutive_403
+            nonlocal consecutive_403, stop_reason
 
             resource_type = getattr(response.request, "resource_type", "")
             if resource_type not in _TRACKED_HTTP_TYPES:
                 return
 
             if response.status == 429:
+                stop_reason = "HTTP 429 rate limit"
+                monitor.set_state("RATE_LIMITED", stop_reason)
                 log.error("HTTP 429 received; stopping instead of retrying aggressively")
+                asyncio.create_task(
+                    safe_notify(
+                        "rate_limited",
+                        "Stake Crash collector stopped after HTTP 429. It will not hammer the site.",
+                    )
+                )
                 stop.set()
                 return
 
@@ -166,7 +208,15 @@ async def collect(settings: CollectorSettings) -> None:
                 consecutive_403 += 1
                 log.warning("HTTP 403 observed (%d/%d)", consecutive_403, settings.max_consecutive_403)
                 if consecutive_403 >= settings.max_consecutive_403:
+                    stop_reason = "repeated HTTP 403 responses"
+                    monitor.set_state("BLOCKED", stop_reason)
                     log.error("Repeated 403 responses; stopping collector")
+                    asyncio.create_task(
+                        safe_notify(
+                            "blocked",
+                            "Stake Crash collector stopped after repeated HTTP 403 responses.",
+                        )
+                    )
                     stop.set()
             elif response.status < 400:
                 consecutive_403 = 0
@@ -177,6 +227,7 @@ async def collect(settings: CollectorSettings) -> None:
         worker_task = asyncio.create_task(worker())
         online_task = asyncio.create_task(online_probe(page))
         challenge_task = asyncio.create_task(challenge_watcher(page))
+        heartbeat_task = asyncio.create_task(heartbeat())
 
         try:
             log.info("Opening %s", settings.url)
@@ -185,21 +236,25 @@ async def collect(settings: CollectorSettings) -> None:
             except Exception as exc:
                 log.warning("Initial navigation did not fully complete: %s", exc)
 
+            monitor.set_state("RUNNING", "browser session active")
             print("Browser opened. Log in manually if needed and keep the Crash page open.")
             print("If a security/CAPTCHA challenge appears, solve it manually in this browser.")
             print("Read-only collector running. Press Ctrl+C to stop.")
 
             while not stop.is_set():
                 if not context.pages:
+                    stop_reason = "browser window closed"
                     break
                 await asyncio.sleep(1)
         finally:
             stop.set()
-            for task in (challenge_task, online_task):
+            for task in (challenge_task, online_task, heartbeat_task):
                 task.cancel()
-            for task in (challenge_task, online_task):
+            for task in (challenge_task, online_task, heartbeat_task):
                 with suppress(asyncio.CancelledError):
                     await task
             await worker_task
             await context.close()
             writer.close()
+            if monitor.state not in {"RATE_LIMITED", "BLOCKED"}:
+                monitor.set_state("STOPPED", stop_reason)
