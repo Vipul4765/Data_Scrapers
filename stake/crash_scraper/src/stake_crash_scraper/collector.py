@@ -16,7 +16,7 @@ from .round_state import RoundState
 from .storage import DatasetWriter, load_or_create_player_salt
 
 log = logging.getLogger(__name__)
-_PLAYING_RE = re.compile(r"(?P<count>\\d+(?:\\.\\d+)?)\\s*(?P<suffix>[kKmM]?)\\s+Playing\\b")
+_PLAYING_RE = re.compile(r"(?P<count>\d+(?:\.\d+)?)\s*(?P<suffix>[kKmM]?)\s+Playing\b")
 _TRACKED_HTTP_TYPES = {"document", "xhr", "fetch"}
 
 
