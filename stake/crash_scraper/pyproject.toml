@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stake-crash-scraper"
+version = "0.1.0"
+description = "Read-only real-time Stake Crash browser data collector"
+requires-python = ">=3.11"
+dependencies = [
+    "playwright>=1.47,<2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<9"]
+
+[project.scripts]
+stake-crash = "stake_crash_scraper.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
