@@ -9,13 +9,15 @@ from typing import Any
 
 from playwright.async_api import BrowserContext, Page, async_playwright
 
+from .challenge import challenge_visible
 from .config import CollectorSettings
 from .parser import normalize_payload, parse_json_frame, safe_shape
 from .round_state import RoundState
 from .storage import DatasetWriter, load_or_create_player_salt
 
 log = logging.getLogger(__name__)
-_PLAYING_RE = re.compile(r"(?P<count>\d+(?:\.\d+)?)\s*(?P<suffix>[kKmM]?)\s+Playing\b")
+_PLAYING_RE = re.compile(r"(?P<count>\\d+(?:\\.\\d+)?)\\s*(?P<suffix>[kKmM]?)\\s+Playing\\b")
+_TRACKED_HTTP_TYPES = {"document", "xhr", "fetch"}
 
 
 def _parse_compact_count(text: str) -> int | None:
@@ -49,6 +51,9 @@ async def collect(settings: CollectorSettings) -> None:
 
     queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=settings.queue_size)
     stop = asyncio.Event()
+    collection_enabled = asyncio.Event()
+    collection_enabled.set()
+
     round_state = RoundState()
     consecutive_403 = 0
 
@@ -57,6 +62,9 @@ async def collect(settings: CollectorSettings) -> None:
             try:
                 frame = await asyncio.wait_for(queue.get(), timeout=0.5)
             except asyncio.TimeoutError:
+                continue
+
+            if not collection_enabled.is_set():
                 continue
 
             payload = parse_json_frame(frame)
@@ -87,10 +95,38 @@ async def collect(settings: CollectorSettings) -> None:
 
     async def online_probe(page: Page) -> None:
         while not stop.is_set():
-            count = await _probe_online_count(page)
-            if count is not None:
-                round_state.update_online_count(count)
+            if collection_enabled.is_set():
+                count = await _probe_online_count(page)
+                if count is not None:
+                    round_state.update_online_count(count)
             await asyncio.sleep(settings.online_count_interval_seconds)
+
+    async def challenge_watcher(page: Page) -> None:
+        challenge_active = False
+
+        while not stop.is_set():
+            visible = await challenge_visible(page)
+
+            if visible:
+                collection_enabled.clear()
+                if not challenge_active:
+                    challenge_active = True
+                    log.warning("Browser security/CAPTCHA challenge detected; pausing collection")
+                    print(
+                        "\nSecurity/CAPTCHA challenge detected. "
+                        "Please solve it manually in the browser. "
+                        "The collector will resume automatically afterward.\n"
+                    )
+                    with suppress(Exception):
+                        await page.bring_to_front()
+            else:
+                if challenge_active:
+                    challenge_active = False
+                    log.info("Challenge cleared; resuming collection")
+                    print("\nChallenge cleared. Collection resumed.\n")
+                collection_enabled.set()
+
+            await asyncio.sleep(settings.challenge_check_interval_seconds)
 
     async with async_playwright() as pw:
         context: BrowserContext = await pw.chromium.launch_persistent_context(
@@ -102,6 +138,8 @@ async def collect(settings: CollectorSettings) -> None:
 
         def on_websocket(ws: Any) -> None:
             def on_frame(frame: Any) -> None:
+                if not collection_enabled.is_set():
+                    return
                 try:
                     queue.put_nowait(frame)
                 except asyncio.QueueFull:
@@ -110,11 +148,21 @@ async def collect(settings: CollectorSettings) -> None:
 
         def on_response(response: Any) -> None:
             nonlocal consecutive_403
+
+            resource_type = getattr(response.request, "resource_type", "")
+            if resource_type not in _TRACKED_HTTP_TYPES:
+                return
+
             if response.status == 429:
                 log.error("HTTP 429 received; stopping instead of retrying aggressively")
                 stop.set()
                 return
+
             if response.status == 403:
+                if not collection_enabled.is_set():
+                    log.info("HTTP 403 observed while manual security challenge is active")
+                    return
+
                 consecutive_403 += 1
                 log.warning("HTTP 403 observed (%d/%d)", consecutive_403, settings.max_consecutive_403)
                 if consecutive_403 >= settings.max_consecutive_403:
@@ -128,6 +176,7 @@ async def collect(settings: CollectorSettings) -> None:
 
         worker_task = asyncio.create_task(worker())
         online_task = asyncio.create_task(online_probe(page))
+        challenge_task = asyncio.create_task(challenge_watcher(page))
 
         try:
             log.info("Opening %s", settings.url)
@@ -137,6 +186,7 @@ async def collect(settings: CollectorSettings) -> None:
                 log.warning("Initial navigation did not fully complete: %s", exc)
 
             print("Browser opened. Log in manually if needed and keep the Crash page open.")
+            print("If a security/CAPTCHA challenge appears, solve it manually in this browser.")
             print("Read-only collector running. Press Ctrl+C to stop.")
 
             while not stop.is_set():
@@ -145,9 +195,11 @@ async def collect(settings: CollectorSettings) -> None:
                 await asyncio.sleep(1)
         finally:
             stop.set()
-            online_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await online_task
+            for task in (challenge_task, online_task):
+                task.cancel()
+            for task in (challenge_task, online_task):
+                with suppress(asyncio.CancelledError):
+                    await task
             await worker_task
             await context.close()
             writer.close()
