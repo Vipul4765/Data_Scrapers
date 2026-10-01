@@ -16,3 +16,4 @@ class CollectorSettings:
     queue_size: int = 20_000
     max_consecutive_403: int = 3
     online_count_interval_seconds: float = 10.0
+    challenge_check_interval_seconds: float = 2.0
