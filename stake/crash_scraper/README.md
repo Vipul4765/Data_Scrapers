@@ -1,8 +1,11 @@
 # Stake Crash Scraper
 
-A small, read-only real-time data collector for the Stake Crash page.
+A read-only Stake Crash data-collection project with two independent collection paths:
 
-It observes WebSocket messages that the normal browser session already receives and writes normalized datasets for offline research. It does **not** place bets, cash out, click betting controls, bypass CAPTCHA, spoof fingerprints, rotate proxies, or hide automation.
+1. **Live browser collector** — captures WebSocket/browser observations such as visible bets, cash-outs, player counts and completed rounds.
+2. **Official round-history sync** — optional independent service that records completed Crash rounds from Stake's documented Crash History API when you have approved affiliate API access.
+
+It does **not** place bets, cash out, click betting controls, bypass CAPTCHA, spoof fingerprints, rotate proxies, or hide automation.
 
 ## Folder structure
 
@@ -10,56 +13,118 @@ It observes WebSocket messages that the normal browser session already receives 
 crash_scraper/
 ├── README.md
 ├── pyproject.toml
+├── .env.example
 ├── .gitignore
+├── deploy/
+│   ├── README.md
+│   └── systemd/
+│       ├── stake-crash.service
+│       ├── stake-crash-history-sync.service
+│       ├── stake-crash-xvfb.service
+│       └── stake-crash-vnc.service
 ├── src/
 │   └── stake_crash_scraper/
 │       ├── __init__.py
 │       ├── __main__.py
 │       ├── challenge.py
 │       ├── cli.py
-│       ├── config.py
 │       ├── collector.py
+│       ├── config.py
+│       ├── continuity.py
+│       ├── history_api.py
+│       ├── history_daemon.py
+│       ├── monitoring.py
 │       ├── parser.py
 │       ├── round_state.py
 │       ├── storage.py
 │       └── types.py
 └── tests/
     ├── test_challenge.py
+    ├── test_continuity.py
+    ├── test_monitoring.py
     ├── test_parser.py
     └── test_round_state.py
 ```
 
-## What is collected
+## Live-browser output
 
 ### `data/rounds.csv`
 
-One row per observed completed round, including:
+One row per completed round observed by the browser, including:
 
-- crash multiplier
-- round ID when exposed
-- timestamps and round duration
-- reported player/bet counts when exposed
-- online-player count
-- unique visible bets/players
-- visible cash-out count
-- observed wager and payout totals
+- crash multiplier;
+- round ID when exposed;
+- timestamps and duration;
+- reported player/bet counts when exposed;
+- online-player count;
+- visible unique bets/players;
+- visible cash-out count;
+- observed wager/payout totals.
 
 ### `data/bet_updates.csv`
 
-Normalized visible bet/cash-out updates:
+Visible bet/cash-out updates:
 
-- time and round linkage
-- bet ID when exposed
-- salted player hash
-- amount/currency
-- cash-out multiplier
-- payout/profit/status when exposed
+- time and round linkage;
+- bet ID when exposed;
+- salted player hash;
+- amount/currency;
+- cash-out multiplier;
+- payout/profit/status when exposed.
 
 ### `data/events.jsonl`
 
-Normalized event stream for later re-processing.
+Normalized browser event stream for later re-processing.
 
-Player identifiers are salted and hashed locally. The salt lives in `data/.player_salt`, which is ignored by Git.
+## Continuity / gap tracking
+
+The browser collector writes:
+
+```text
+runtime/
+├── status.json
+└── gaps.jsonl
+```
+
+Every known interruption is recorded instead of silently turning missing observations into zeros. Examples include:
+
+- CAPTCHA/security challenge;
+- HTTP 403 block;
+- HTTP 429 rate limit;
+- browser close/crash.
+
+This is important for ML because a missing live feature is **unknown**, not zero.
+
+## Optional official completed-round history
+
+If you have approved Stake API access, configure:
+
+```text
+STAKE_CRASH_API_TOKEN=...
+```
+
+Then run:
+
+```bash
+stake-crash-history-sync
+```
+
+It writes:
+
+```text
+data/official_rounds.csv
+```
+
+This service is independent of Chromium, so completed crash results can continue being archived while the browser collector is paused by a challenge.
+
+Official-history rows are marked:
+
+```text
+source=official_api
+live_features_complete=false
+```
+
+That flag matters: the history API can recover completed-round results, but it cannot reconstruct live player/bet observations that were never delivered to the browser during an interruption.
 
 ## Install
 
@@ -71,7 +136,7 @@ python -m pip install -e ".[dev]"
 playwright install chromium
 ```
 
-## Run
+## Run live collector
 
 ```powershell
 stake-crash
@@ -85,71 +150,38 @@ python -m stake_crash_scraper
 
 A normal Chromium window opens. Log in manually if required and keep Crash open.
 
-### CAPTCHA / security challenge handling
+## CAPTCHA / security challenges
 
-If the site presents a CAPTCHA or browser-security challenge, the collector:
+If a CAPTCHA or browser-security challenge appears, the live collector:
 
-1. detects the challenge;
-2. pauses WebSocket data processing;
-3. brings the browser window forward;
-4. waits while **you solve the challenge manually**;
-5. resumes automatically when the normal page is back.
+1. detects it;
+2. pauses browser-event processing;
+3. records the gap start;
+4. brings the browser forward;
+5. waits for manual completion;
+6. records the gap end and resumes automatically.
 
-It never attempts to solve, bypass, hide, or defeat the challenge and it does not refresh-loop against the page.
+It does not auto-solve or bypass the challenge.
 
-## Schema diagnostics
+If the independent official-history service is configured, it can continue recording completed-round results during the browser gap.
 
-```powershell
-stake-crash --debug-shapes
-```
+## Server deployment
 
-This prints only JSON keys and value types, never raw payload values or credentials.
+See `deploy/README.md`.
 
-## Reliability / rate handling
+The systemd setup provides:
 
-- persistent browser profile instead of repeated logins;
-- manual login and manual security-challenge completion;
-- automatic pause/resume around challenges;
-- no automated betting actions;
-- no page-refresh loop;
-- stops on HTTP 429;
-- counts only document/XHR/fetch 403s for blocking logic;
-- stops after repeated relevant HTTP 403 responses;
-- online-player text sampled only every 10 seconds;
-- bounded WebSocket queue;
-- graceful shutdown with flushed CSV/JSONL files.
-
-## Ubuntu server / overnight operation
-
-Production-style deployment files are under:
-
-```text
-deploy/
-├── README.md
-└── systemd/
-    ├── stake-crash.service
-    ├── stake-crash-xvfb.service
-    └── stake-crash-vnc.service
-```
-
-The server setup adds:
-
-- systemd restart on genuine process/browser failure;
-- no restart loop after HTTP 429 or repeated HTTP 403;
-- persistent data and browser-profile directories;
-- atomic `runtime/status.json` heartbeat/status;
-- optional operational webhook alerts;
+- restart after genuine browser/process failure;
+- no aggressive retry loop after 403/429;
+- persistent data/profile/runtime directories;
+- atomic health files;
+- optional webhook alerts;
 - Xvfb virtual display;
-- localhost-only VNC access through an SSH tunnel for manual security challenges.
-
-A challenge can leave the collector safely paused overnight. It does not lose or corrupt already-flushed rows, and it resumes automatically after the challenge is manually cleared.
-
-See `deploy/README.md` for installation and remote-access commands.
+- localhost-only VNC through an SSH tunnel;
+- optional independent official-history synchronization.
 
 ## Test
 
 ```powershell
 pytest -q
 ```
-
-The parser/state tests use synthetic data because the site's internal live schema can change without notice.
