@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 
 from .collector import collect
-from .config import CollectorSettings, DEFAULT_HISTORY_API_URL, DEFAULT_URL
+from .config import CollectorSettings, DEFAULT_URL
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -36,8 +36,6 @@ def main() -> None:
         headless=args.headless,
         debug_shapes=args.debug_shapes,
         alert_webhook_url=os.getenv("STAKE_CRASH_ALERT_WEBHOOK"),
-        history_api_token=os.getenv("STAKE_CRASH_API_TOKEN"),
-        history_api_url=os.getenv("STAKE_CRASH_HISTORY_API_URL", DEFAULT_HISTORY_API_URL),
     )
     try:
         asyncio.run(collect(settings))
