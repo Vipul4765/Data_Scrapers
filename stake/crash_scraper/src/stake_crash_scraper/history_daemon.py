@@ -17,8 +17,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--runtime-dir", type=Path, default=Path("runtime/history"))
     parser.add_argument("--interval-seconds", type=float, default=60.0)
     parser.add_argument("--startup-lookback-hours", type=float, default=12.0)
-    parser.add_argument("--page-size", type=int, default=100)
-    parser.add_argument("--max-startup-pages", type=int, default=100)
+    parser.add_argument("--page-size", type=int, default=50)
+    parser.add_argument("--max-startup-pages", type=int, default=200)
     parser.add_argument("--max-periodic-pages", type=int, default=5)
     parser.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO")
     return parser
@@ -31,14 +31,17 @@ async def run() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     log = logging.getLogger(__name__)
+    monitor = RuntimeMonitor(args.runtime_dir)
 
     token = os.getenv("STAKE_CRASH_API_TOKEN")
     if not token:
-        raise SystemExit("STAKE_CRASH_API_TOKEN is required and must belong to approved API access.")
+        message = "STAKE_CRASH_API_TOKEN is not configured; official history sync is disabled."
+        monitor.set_state("DISABLED", message)
+        log.warning(message)
+        return
 
     endpoint = os.getenv("STAKE_CRASH_HISTORY_API_URL", "https://api.stake.com/crash/history")
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    monitor = RuntimeMonitor(args.runtime_dir)
 
     client = StakeCrashHistoryClient(
         token=token,
@@ -61,7 +64,8 @@ async def run() -> None:
         log.info("Startup history sync: fetched=%d written=%d", stats.fetched, stats.written)
     except PermissionError as exc:
         monitor.set_state("DENIED", str(exc))
-        raise SystemExit(str(exc)) from exc
+        log.error("%s", exc)
+        return
 
     backoff = args.interval_seconds
     while True:
@@ -79,7 +83,8 @@ async def run() -> None:
             backoff = args.interval_seconds
         except PermissionError as exc:
             monitor.set_state("DENIED", str(exc))
-            raise SystemExit(str(exc)) from exc
+            log.error("%s", exc)
+            return
         except Exception as exc:
             log.warning("History sync failed: %s", exc)
             monitor.set_state("DEGRADED", str(exc))
