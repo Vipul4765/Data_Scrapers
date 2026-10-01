@@ -1,0 +1,11 @@
+[Unit]
+Description=Virtual display for Stake Crash collector
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/Xvfb :99 -screen 0 1440x900x24 -nolisten tcp
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
