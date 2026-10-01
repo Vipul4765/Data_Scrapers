@@ -14,6 +14,12 @@ This deployment keeps the browser session persistent and makes the collector rec
 
 A CAPTCHA is deliberately **not** auto-solved. For unattended servers, use remote desktop access when a challenge requires a human.
 
+
+
+## Best unattended option
+
+If you are eligible for Stake's official API access, prefer the documented Crash History API over browser scraping for server-side collection. It removes browser/CAPTCHA dependency. Stake currently documents Crash History for approved affiliates.
+
 ## Install
 
 Example Ubuntu packages:
