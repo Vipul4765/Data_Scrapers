@@ -64,7 +64,7 @@ class StakeCrashHistoryClient:
         token: str,
         output_path: Path,
         endpoint: str,
-        page_size: int = 100,
+        page_size: int = 50,
         page_delay_seconds: float = 1.0,
         timeout_seconds: float = 10.0,
     ) -> None:
@@ -170,6 +170,9 @@ class StakeCrashHistoryClient:
                     )
                     if oldest_in_page <= since_ms:
                         break
+
+                f.flush()
+                os.fsync(f.fileno())
 
                 if len(rounds) < self.page_size:
                     break
