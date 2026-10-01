@@ -141,6 +141,7 @@ History service states include:
 - `RUNNING`
 - `DEGRADED`
 - `DENIED`
+- `DISABLED`
 
 ## Manual challenge from another computer
 
