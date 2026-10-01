@@ -56,7 +56,7 @@ class CsvAppender:
         self.writer = csv.DictWriter(self.handle, fieldnames=self.fields, extrasaction="ignore")
         if not existed:
             self.writer.writeheader()
-            self.handle.flush()
+            self.sync()
 
     def append(self, row: dict[str, Any]) -> None:
         if self.writer is None or self.handle is None:
@@ -64,8 +64,15 @@ class CsvAppender:
         self.writer.writerow({field: row.get(field) for field in self.fields})
         self.handle.flush()
 
+    def sync(self) -> None:
+        if self.handle is None:
+            return
+        self.handle.flush()
+        os.fsync(self.handle.fileno())
+
     def close(self) -> None:
         if self.handle is not None:
+            self.handle.flush()
             self.handle.close()
             self.handle = None
             self.writer = None
@@ -86,8 +93,15 @@ class JsonlAppender:
         self.handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
         self.handle.flush()
 
+    def sync(self) -> None:
+        if self.handle is None:
+            return
+        self.handle.flush()
+        os.fsync(self.handle.fileno())
+
     def close(self) -> None:
         if self.handle is not None:
+            self.handle.flush()
             self.handle.close()
             self.handle = None
 
@@ -129,6 +143,8 @@ class DatasetWriter:
 
     def write_round(self, row: dict[str, Any]) -> None:
         self.rounds.append(row)
+        self.rounds.sync()
+        self.events.sync()
 
     def close(self) -> None:
         self.events.close()
