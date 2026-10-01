@@ -1,0 +1,21 @@
+[Unit]
+Description=Stake Crash read-only collector
+After=network-online.target stake-crash-xvfb.service
+Wants=network-online.target
+Requires=stake-crash-xvfb.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/stake-crash
+Environment=DISPLAY=:99
+EnvironmentFile=-/opt/stake-crash/.env
+ExecStart=/opt/stake-crash/.venv/bin/stake-crash --output-dir /var/lib/stake-crash/data --profile-dir /var/lib/stake-crash/profile --runtime-dir /var/lib/stake-crash/runtime
+Restart=on-failure
+RestartSec=20
+TimeoutStopSec=30
+KillSignal=SIGINT
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
