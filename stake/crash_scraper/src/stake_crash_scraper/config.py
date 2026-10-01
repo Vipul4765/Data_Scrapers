@@ -11,9 +11,12 @@ class CollectorSettings:
     url: str = DEFAULT_URL
     output_dir: Path = Path("data")
     profile_dir: Path = Path(".browser-profile")
+    runtime_dir: Path = Path("runtime")
     headless: bool = False
     debug_shapes: bool = False
     queue_size: int = 20_000
     max_consecutive_403: int = 3
     online_count_interval_seconds: float = 10.0
     challenge_check_interval_seconds: float = 2.0
+    heartbeat_interval_seconds: float = 30.0
+    alert_webhook_url: str | None = None
