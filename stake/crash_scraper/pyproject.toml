@@ -16,6 +16,7 @@ dev = ["pytest>=8,<9"]
 
 [project.scripts]
 stake-crash = "stake_crash_scraper.cli:main"
+stake-crash-history-sync = "stake_crash_scraper.history_daemon:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
