@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from contextlib import suppress
 from typing import Any
 
@@ -11,6 +12,8 @@ from playwright.async_api import BrowserContext, Page, async_playwright
 
 from .challenge import challenge_visible
 from .config import CollectorSettings
+from .continuity import ContinuityJournal, utc_to_ms
+from .history_api import StakeCrashHistoryClient
 from .monitoring import RuntimeMonitor, WebhookNotifier
 from .parser import normalize_payload, parse_json_frame, safe_shape
 from .round_state import RoundState
@@ -59,16 +62,83 @@ async def collect(settings: CollectorSettings) -> None:
     round_state = RoundState()
     monitor = RuntimeMonitor(settings.runtime_dir)
     notifier = WebhookNotifier(settings.alert_webhook_url)
-    monitor.set_state("STARTING")
+    continuity = ContinuityJournal(settings.runtime_dir)
+
+    previous_status_at = continuity.previous_status_updated_at()
+    startup_since_ms = (
+        utc_to_ms(previous_status_at)
+        if previous_status_at
+        else int((time.time() - settings.history_sync_lookback_hours * 3600.0) * 1000)
+    )
+
+    history_client = None
+    if settings.history_api_token:
+        history_client = StakeCrashHistoryClient(
+            token=settings.history_api_token,
+            output_path=settings.output_dir / "official_rounds.csv",
+            endpoint=settings.history_api_url,
+            page_size=settings.history_sync_page_size,
+        )
+
+    monitor.set_state(
+        "STARTING",
+        history_api_enabled=history_client is not None,
+        history_api_note="approved affiliate access required" if history_client else "not configured",
+    )
 
     consecutive_403 = 0
     stop_reason = "collector stopped"
+    fatal_error: RuntimeError | None = None
 
     async def safe_notify(event: str, message: str) -> None:
         try:
             await notifier.send(event, message)
         except Exception as exc:
             log.warning("Alert webhook failed: %s", exc)
+
+    async def sync_history_since(since_ms: int, reason: str) -> tuple[str, int]:
+        if history_client is None:
+            return "not_configured", 0
+        try:
+            stats = await history_client.sync_since(
+                since_ms,
+                max_pages=settings.history_sync_max_pages,
+            )
+            monitor.update(
+                official_history_last_sync_reason=reason,
+                official_history_last_sync_written=stats.written,
+                official_history_last_sync_fetched=stats.fetched,
+            )
+            continuity.record(
+                "official_history_sync",
+                reason=reason,
+                fetched=stats.fetched,
+                written=stats.written,
+                since_ms=since_ms,
+            )
+            return "ok", stats.written
+        except PermissionError as exc:
+            log.error("%s", exc)
+            monitor.update(official_history_error="permission_denied")
+            await safe_notify("history_api_denied", str(exc))
+            return "permission_denied", 0
+        except Exception as exc:
+            log.warning("Official Crash History sync failed: %s", exc)
+            monitor.update(official_history_error=str(exc))
+            return "error", 0
+
+    async def history_sync_loop() -> None:
+        if history_client is None:
+            return
+
+        await sync_history_since(startup_since_ms, "startup")
+
+        while not stop.is_set():
+            await asyncio.sleep(settings.history_sync_interval_seconds)
+            since_ms = int((time.time() - settings.history_sync_lookback_hours * 3600.0) * 1000)
+            status, _ = await sync_history_since(since_ms, "periodic")
+            if status == "permission_denied":
+                return
 
     async def worker() -> None:
         while not stop.is_set() or not queue.empty():
@@ -135,28 +205,47 @@ async def collect(settings: CollectorSettings) -> None:
                 collection_enabled.clear()
                 if not challenge_active:
                     challenge_active = True
-                    monitor.set_state("CHALLENGE", "manual CAPTCHA/security verification required")
-                    log.warning("Browser security/CAPTCHA challenge detected; pausing collection")
+                    gap = continuity.start_gap("browser_challenge")
+                    monitor.set_state(
+                        "CHALLENGE",
+                        "manual CAPTCHA/security verification required",
+                        current_gap_started_at_utc=gap.started_at_utc,
+                    )
+                    log.warning("Browser security/CAPTCHA challenge detected; pausing live browser collection")
                     print(
                         "\nSecurity/CAPTCHA challenge detected. "
-                        "Please solve it manually in the browser. "
-                        "The collector will resume automatically afterward.\n"
+                        "Live browser collection is paused. "
+                        "Official history sync continues if approved API access is configured.\n"
                     )
                     await safe_notify(
                         "challenge_detected",
-                        "Stake Crash collector paused: manual CAPTCHA/security verification is required.",
+                        "Stake Crash live browser collection paused: manual CAPTCHA/security verification is required.",
                     )
                     with suppress(Exception):
                         await page.bring_to_front()
             else:
                 if challenge_active:
                     challenge_active = False
-                    monitor.set_state("RUNNING", "challenge cleared")
-                    log.info("Challenge cleared; resuming collection")
-                    print("\nChallenge cleared. Collection resumed.\n")
+                    gap = continuity.current
+                    backfill_status, written = (
+                        await sync_history_since(gap.started_at_ms, "challenge_recovery")
+                        if gap is not None
+                        else ("no_gap", 0)
+                    )
+                    continuity.end_gap(
+                        backfill_status=backfill_status,
+                        backfill_written=written,
+                    )
+                    monitor.set_state(
+                        "RUNNING",
+                        "challenge cleared",
+                        current_gap_started_at_utc=None,
+                    )
+                    log.info("Challenge cleared; live browser collection resumed")
+                    print("\nChallenge cleared. Live collection resumed.\n")
                     await safe_notify(
                         "challenge_cleared",
-                        "Stake Crash collector resumed after the manual challenge was cleared.",
+                        "Stake Crash live browser collection resumed after the manual challenge was cleared.",
                     )
                 collection_enabled.set()
 
@@ -189,12 +278,13 @@ async def collect(settings: CollectorSettings) -> None:
 
             if response.status == 429:
                 stop_reason = "HTTP 429 rate limit"
+                continuity.start_gap("http_429")
                 monitor.set_state("RATE_LIMITED", stop_reason)
-                log.error("HTTP 429 received; stopping instead of retrying aggressively")
+                log.error("HTTP 429 received; stopping live browser collector instead of retrying aggressively")
                 asyncio.create_task(
                     safe_notify(
                         "rate_limited",
-                        "Stake Crash collector stopped after HTTP 429. It will not hammer the site.",
+                        "Stake Crash live collector stopped after HTTP 429. Existing data is preserved.",
                     )
                 )
                 stop.set()
@@ -209,12 +299,13 @@ async def collect(settings: CollectorSettings) -> None:
                 log.warning("HTTP 403 observed (%d/%d)", consecutive_403, settings.max_consecutive_403)
                 if consecutive_403 >= settings.max_consecutive_403:
                     stop_reason = "repeated HTTP 403 responses"
+                    continuity.start_gap("http_403")
                     monitor.set_state("BLOCKED", stop_reason)
-                    log.error("Repeated 403 responses; stopping collector")
+                    log.error("Repeated 403 responses; stopping live browser collector")
                     asyncio.create_task(
                         safe_notify(
                             "blocked",
-                            "Stake Crash collector stopped after repeated HTTP 403 responses.",
+                            "Stake Crash live collector stopped after repeated HTTP 403 responses.",
                         )
                     )
                     stop.set()
@@ -228,6 +319,7 @@ async def collect(settings: CollectorSettings) -> None:
         online_task = asyncio.create_task(online_probe(page))
         challenge_task = asyncio.create_task(challenge_watcher(page))
         heartbeat_task = asyncio.create_task(heartbeat())
+        history_task = asyncio.create_task(history_sync_loop())
 
         try:
             log.info("Opening %s", settings.url)
@@ -237,6 +329,7 @@ async def collect(settings: CollectorSettings) -> None:
                 log.warning("Initial navigation did not fully complete: %s", exc)
 
             monitor.set_state("RUNNING", "browser session active")
+            continuity.record("collector_started", history_api_enabled=history_client is not None)
             print("Browser opened. Log in manually if needed and keep the Crash page open.")
             print("If a security/CAPTCHA challenge appears, solve it manually in this browser.")
             print("Read-only collector running. Press Ctrl+C to stop.")
@@ -244,17 +337,23 @@ async def collect(settings: CollectorSettings) -> None:
             while not stop.is_set():
                 if not context.pages:
                     stop_reason = "browser window closed"
+                    continuity.start_gap("browser_closed")
+                    fatal_error = RuntimeError(stop_reason)
                     break
                 await asyncio.sleep(1)
         finally:
             stop.set()
-            for task in (challenge_task, online_task, heartbeat_task):
+            for task in (challenge_task, online_task, heartbeat_task, history_task):
                 task.cancel()
-            for task in (challenge_task, online_task, heartbeat_task):
+            for task in (challenge_task, online_task, heartbeat_task, history_task):
                 with suppress(asyncio.CancelledError):
                     await task
             await worker_task
             await context.close()
             writer.close()
+            continuity.record("collector_stopped", reason=stop_reason)
             if monitor.state not in {"RATE_LIMITED", "BLOCKED"}:
                 monitor.set_state("STOPPED", stop_reason)
+
+    if fatal_error is not None:
+        raise fatal_error
