@@ -1,0 +1,7 @@
+span_files/
+__pycache__/
+.venv/
+.ruff_cache/
+*.spn
+# Docs live in aa_docs/ as plain text, never as pushed .md
+README.md
